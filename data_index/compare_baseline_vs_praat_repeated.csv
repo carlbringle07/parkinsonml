@@ -1,0 +1,3 @@
+name,n_splits_used,splits_skipped_no_both_classes,auc_mean,auc_std,auc_min,auc_max,train_n_mean,test_n_mean
+baseline,50,0,0.9502273242630385,0.06727494264188644,0.6444444444444445,1.0,32.0,14.0
+baseline_plus_praat,50,0,0.9375323129251701,0.08323528774364913,0.6444444444444445,1.0,32.0,14.0

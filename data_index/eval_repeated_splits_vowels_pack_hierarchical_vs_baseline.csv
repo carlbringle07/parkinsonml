@@ -1,0 +1,3 @@
+variant,n_splits,test_size,auc_mean,auc_std,auc_min,auc_max,n_speakers,n_pd,n_ctrl,n_features,auc_mean_delta_vs_baseline
+baseline_person,50,0.25,0.973406746031746,0.07239991263916612,0.5625,1.0,46,24,22,35,0.0
+hierarchical_person,50,0.25,0.973406746031746,0.07239991263916612,0.5625,1.0,46,24,22,35,0.0
