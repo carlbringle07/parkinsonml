@@ -1,468 +1,337 @@
 """
-scripts/43_robustness_conformal_screening_vowels_pack_baseline_vs_praat.py
+Step 43 (rebuild): Robustness + conformal screening for vowels_pack (baseline vs baseline+Praat).
 
-Robustness + Conformal screening (vowels_pack): baseline vs baseline+Praat
+Goals
+-----
+1) Reproducible speaker-wise repeated splits.
+2) Robust handling of noisy conditions (clean, snr20, snr10).
+3) Reliable outputs for both model variants:
+   - baseline
+   - baseline_plus_praat
+4) Explicit uncertainty accounting (decided vs unsure) + confusion matrices.
 
-- Normaliserar task_code -> base_task (VA1, VE2, ...)
-- Lägger till SimpleImputer(strategy="median") i pipeline (fixar NaN)
+This script intentionally reads the canonical file-level table created in step 26:
+  data_index/features_vowels_pack_file.csv
+which already contains a filtered vowels_pack cohort and avoids fragile filtering from file_index.csv.
 """
 
 from __future__ import annotations
 
 import hashlib
-import re
+import json
+import math
 from pathlib import Path
-import warnings
-
-import numpy as np
-import pandas as pd
-
-warnings.filterwarnings("ignore")
+from typing import Any
 
 import librosa
+import numpy as np
+import pandas as pd
+import parselmouth
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import StratifiedShuffleSplit
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import roc_auc_score
-from sklearn.impute import SimpleImputer
-def merge_praat_person_features(df_person, praat_person_csv=r"data_index\praat_vowels_pack_person.csv", merge_key="speaker"):
-    """
-    Merge person-level Praat features into df_person.
-
-    Expects praat_person_csv to have one row per speaker/person, with columns like:
-      f0_mean_hz, f0_std_hz, f0_min_hz, f0_max_hz, hnr_mean_db, jitter_local, shimmer_local
-    (either prefixed with praat_ already, or not). We will prefix with praat_ if missing.
-
-    Sanity-check: Warn (not crash) if the *feature* columns (f0/hnr/jitter/shimmer) look all-NaN or constant.
-    """
-    import pandas as pd
-    import numpy as np
-
-    out = df_person.copy()
-
-    if praat_person_csv is None:
-        return out
-
-    praat_path = Path(praat_person_csv)
-    if not praat_path.exists():
-        # If file doesn't exist, just return baseline (but warn)
-        print(f"[WARN] Praat person CSV not found: {praat_person_csv}. Continuing without Praat.")
-        return out
-
-    praat = pd.read_csv(praat_path)
-
-    # --- Find merge key in both tables ---
-    def _find_key(df):
-        for cand in ["speaker", "person", "subject", "id", "ID", "Speaker", "Person"]:
-            if cand in df.columns:
-                return cand
-        return None
-
-    key_a = merge_key if merge_key in out.columns else _find_key(out)
-    key_b = merge_key if merge_key in praat.columns else _find_key(praat)
-
-    if key_a is None or key_b is None:
-        print(f"[WARN] Could not find merge keys (df_person key={key_a}, praat key={key_b}). Continuing without Praat.")
-        return out
-
-    if key_a != merge_key:
-        out = out.rename(columns={key_a: merge_key})
-    if key_b != merge_key:
-        praat = praat.rename(columns={key_b: merge_key})
-
-    # --- Ensure praat columns are prefixed with 'praat_' (except merge_key) ---
-    new_cols = {}
-    for c in praat.columns:
-        if c == merge_key:
-            continue
-        cl = str(c)
-        if cl.lower().startswith("praat_"):
-            new_cols[c] = cl
-        else:
-            new_cols[c] = "praat_" + cl
-    praat = praat.rename(columns=new_cols)
-
-    # If duplicates per speaker, aggregate safely
-    if praat[merge_key].duplicated().any():
-        num_cols = [c for c in praat.columns if c != merge_key and pd.api.types.is_numeric_dtype(praat[c])]
-        other_cols = [c for c in praat.columns if c != merge_key and c not in num_cols]
-        agg = {}
-        for c in num_cols:
-            agg[c] = "mean"
-        for c in other_cols:
-            agg[c] = "first"
-        praat = praat.groupby(merge_key, as_index=False).agg(agg)
-
-    # Merge
-    out = out.merge(praat, on=merge_key, how="left")
-
-    # --- Sanity-check (features only, ignore metadata like praat_label/praat_n_files/praat_ok_rate) ---
-    praat_cols = [c for c in out.columns if str(c).lower().startswith("praat_")]
-    praat_feat_cols = [c for c in praat_cols if any(k in str(c).lower() for k in ["f0", "hnr", "jitter", "shimmer"])]
-
-    if len(praat_feat_cols) == 0:
-        print("[WARN] No praat feature columns (f0/hnr/jitter/shimmer) found after merge. +Praat may be ≈ baseline.")
-        return out
-
-    nan_max = float(out[praat_feat_cols].isna().mean().max())
-    nun = out[praat_feat_cols].nunique(dropna=False).sort_values()
-    nun_min = int(nun.min()) if len(nun) else 0
-
-    if nan_max > 0.0 or nun_min <= 1:
-        print(
-            "[WARN] Praat sanity-check triggade (endast riktiga praat-features). "
-            "Om praat_* är NaN/konstanta kommer +Praat ≈ baseline.\n"
-            f"nan_max={nan_max}\n"
-            "nunique head:\n" + str(nun.head(20))
-        )
-
-    return out
 
 
+# =========================
+# Config
+# =========================
+ROOT = Path(__file__).resolve().parents[1]
+DATA_INDEX = ROOT / "data_index"
 
-def stable_u32(s: str) -> int:
-    h = hashlib.md5(s.encode("utf-8")).hexdigest()
-    return int(h[:8], 16)
+INPUT_FILE_LIST = DATA_INDEX / "features_vowels_pack_file.csv"
+CACHE_DIR = DATA_INDEX / "robustness_cache_vowels_pack_43"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+ALPHA = 0.10
+N_SPLITS = 50
+TEST_SIZE = 0.25
+CALIB_FRAC_OF_TRAIN = 0.25
+RANDOM_STATE = 123
+SR = 16000
+
+LABEL_MAP = {"control_elderly": 0, "pd": 1}
+INV_LABEL_MAP = {0: "control", 1: "pd"}
+
+CONDITIONS: list[dict[str, Any]] = [
+    {"name": "clean", "type": "clean"},
+    {"name": "snr20", "type": "snr", "snr_db": 20.0},
+    {"name": "snr10", "type": "snr", "snr_db": 10.0},
+]
+
+OUT_PER_SPLIT = DATA_INDEX / f"robustness_conformal_screening_vowels_pack_baseline_vs_praat_alpha{ALPHA:.2f}_per_split.csv"
+OUT_SUMMARY = DATA_INDEX / f"robustness_conformal_screening_vowels_pack_baseline_vs_praat_alpha{ALPHA:.2f}_summary.csv"
+OUT_CONFUSION = DATA_INDEX / f"robustness_conformal_screening_vowels_pack_baseline_vs_praat_alpha{ALPHA:.2f}_confusion_counts.csv"
+OUT_RUNINFO = DATA_INDEX / f"robustness_conformal_screening_vowels_pack_baseline_vs_praat_alpha{ALPHA:.2f}_runinfo.json"
 
 
-def safe_float(x) -> float:
-    try:
-        return float(x)
-    except Exception:
-        return np.nan
+# =========================
+# Utilities
+# =========================
+def stable_seed(text: str) -> int:
+    return int(hashlib.md5(text.encode("utf-8")).hexdigest()[:8], 16)
 
 
-def load_audio(path: str | Path, sr: int = SR) -> tuple[np.ndarray, int]:
-    y, sr2 = librosa.load(str(path), sr=sr, mono=True)
-    if y is None or len(y) == 0:
-        return np.zeros(1, dtype=np.float32), sr2
+def apply_condition(y: np.ndarray, condition: dict[str, Any], rng: np.random.Generator) -> np.ndarray:
     y = y.astype(np.float32, copy=False)
-    y, _ = librosa.effects.trim(y, top_db=TRIM_TOP_DB)
-    if len(y) == 0:
-        y = np.zeros(1, dtype=np.float32)
-    return y, sr2
 
+    if condition["type"] == "clean":
+        return y
 
-def apply_condition(y: np.ndarray, condition: str, rng: np.random.Generator) -> np.ndarray:
-    y2 = y.astype(np.float32, copy=True)
-
-    if condition == "clean":
-        return y2
-
-    if condition.startswith("snr"):
-        snr_db = 20.0 if condition == "snr20" else 10.0
-        sig_power = float(np.mean(y2 ** 2)) + 1e-12
+    if condition["type"] == "snr":
+        snr_db = float(condition["snr_db"])
+        sig_power = float(np.mean(y * y) + 1e-12)
         noise_power = sig_power / (10.0 ** (snr_db / 10.0))
-        noise = rng.normal(0.0, np.sqrt(noise_power), size=y2.shape).astype(np.float32)
-        return np.clip(y2 + noise, -1.0, 1.0)
+        noise = rng.normal(0.0, math.sqrt(noise_power), size=y.shape).astype(np.float32)
+        return np.clip(y + noise, -1.0, 1.0)
 
-    if condition == "vol0p5":
-        return np.clip(y2 * 0.5, -1.0, 1.0)
-
-    if condition == "vol2p0":
-        return np.clip(y2 * 2.0, -1.0, 1.0)
-
-    raise ValueError(f"Okänd condition: {condition}")
+    raise ValueError(f"Unknown condition type: {condition['type']}")
 
 
 def baseline_features(y: np.ndarray, sr: int) -> dict[str, float]:
+    if y.size < sr // 20:
+        y = np.pad(y, (0, sr // 20 - y.size), mode="constant")
+
     feats: dict[str, float] = {}
 
-    # Pitch (yin)
-    try:
-        f0 = librosa.yin(y=y, fmin=50, fmax=500, sr=sr)
-        f0 = f0[np.isfinite(f0)]
-        f0 = f0[f0 > 0]
-        feats["f0_median"] = float(np.median(f0)) if len(f0) else np.nan
-        feats["f0_mean"] = float(np.mean(f0)) if len(f0) else np.nan
-        feats["f0_std"] = float(np.std(f0)) if len(f0) else np.nan
-    except Exception:
-        feats["f0_median"] = np.nan
-        feats["f0_mean"] = np.nan
-        feats["f0_std"] = np.nan
+    rms = librosa.feature.rms(y=y)[0]
+    zcr = librosa.feature.zero_crossing_rate(y=y)[0]
+    centroid = librosa.feature.spectral_centroid(y=y, sr=sr)[0]
+    rolloff = librosa.feature.spectral_rolloff(y=y, sr=sr, roll_percent=0.85)[0]
+    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
 
-    # HNR approx
-    try:
-        harm, perc = librosa.effects.hpss(y)
-        ph = float(np.sum(harm**2)) + 1e-12
-        pn = float(np.sum(perc**2)) + 1e-12
-        feats["hnr_mean_db"] = float(10.0 * np.log10(ph / pn))
-    except Exception:
-        feats["hnr_mean_db"] = np.nan
+    feats["duration_s"] = float(len(y) / sr)
+    feats["rms_mean"] = float(np.mean(rms))
+    feats["rms_std"] = float(np.std(rms))
+    feats["zcr_mean"] = float(np.mean(zcr))
+    feats["zcr_std"] = float(np.std(zcr))
+    feats["centroid_mean"] = float(np.mean(centroid))
+    feats["centroid_std"] = float(np.std(centroid))
+    feats["rolloff_mean"] = float(np.mean(rolloff))
+    feats["rolloff_std"] = float(np.std(rolloff))
 
-    # Spectral centroid/rolloff
-    try:
-        centroid = librosa.feature.spectral_centroid(y=y, sr=sr)[0]
-        feats["spectral_centroid_mean"] = float(np.mean(centroid))
-        feats["spectral_centroid_std"] = float(np.std(centroid))
-    except Exception:
-        feats["spectral_centroid_mean"] = np.nan
-        feats["spectral_centroid_std"] = np.nan
+    mfcc_mean = np.mean(mfcc, axis=1)
+    mfcc_std = np.std(mfcc, axis=1)
+    for i in range(13):
+        feats[f"mfcc{i+1}_mean"] = float(mfcc_mean[i])
+        feats[f"mfcc{i+1}_std"] = float(mfcc_std[i])
 
-    try:
-        rolloff = librosa.feature.spectral_rolloff(y=y, sr=sr, roll_percent=0.85)[0]
-        feats["spectral_rolloff_mean"] = float(np.mean(rolloff))
-        feats["spectral_rolloff_std"] = float(np.std(rolloff))
-    except Exception:
-        feats["spectral_rolloff_mean"] = np.nan
-        feats["spectral_rolloff_std"] = np.nan
-
-    # ZCR
-    try:
-        zcr = librosa.feature.zero_crossing_rate(y)[0]
-        feats["zcr_mean"] = float(np.mean(zcr))
-    except Exception:
-        feats["zcr_mean"] = np.nan
-
-    # MFCC 13 (mean + std)
-    try:
-        mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
-        mfcc_mean = np.mean(mfcc, axis=1)
-        mfcc_std = np.std(mfcc, axis=1)
-        for i in range(13):
-            feats[f"mfcc_mean_{i+1}"] = float(mfcc_mean[i])
-        for i in range(13):
-            feats[f"mfcc_std_{i+1}"] = float(mfcc_std[i])
-    except Exception:
-        for i in range(13):
-            feats[f"mfcc_mean_{i+1}"] = np.nan
-        for i in range(13):
-            feats[f"mfcc_std_{i+1}"] = np.nan
+    for k, v in list(feats.items()):
+        if not np.isfinite(v):
+            feats[k] = np.nan
 
     return feats
 
 
 def praat_features(y: np.ndarray, sr: int) -> dict[str, float]:
-    feats: dict[str, float] = {
-        "praat_f0_mean_hz": np.nan,
-        "praat_f0_std_hz": np.nan,
-        "praat_f0_min_hz": np.nan,
-        "praat_f0_max_hz": np.nan,
-        "praat_f0_median_hz": np.nan,
-        "praat_f0_range_hz": np.nan,
-        "praat_hnr_mean_db": np.nan,
-        "praat_jitter_local": np.nan,
-        "praat_shimmer_local": np.nan,
+    snd = parselmouth.Sound(y.astype(np.float64), sampling_frequency=sr)
+
+    pitch = snd.to_pitch(pitch_floor=60.0, pitch_ceiling=400.0)
+    f0 = pitch.selected_array["frequency"]
+    f0 = f0[np.isfinite(f0)]
+    f0 = f0[f0 > 0]
+
+    f0_mean = float(np.mean(f0)) if f0.size else np.nan
+    f0_std = float(np.std(f0)) if f0.size else np.nan
+    f0_min = float(np.min(f0)) if f0.size else np.nan
+    f0_max = float(np.max(f0)) if f0.size else np.nan
+
+    harmonicity = snd.to_harmonicity_cc(time_step=0.01, minimum_pitch=60.0)
+    hnr_vals = harmonicity.values
+    hnr_vals = hnr_vals[np.isfinite(hnr_vals)]
+    hnr_mean = float(np.mean(hnr_vals)) if hnr_vals.size else np.nan
+
+    jitter_local = np.nan
+    shimmer_local = np.nan
+    point_process = parselmouth.praat.call(snd, "To PointProcess (periodic, cc)", 60.0, 400.0)
+    try:
+        jitter_local = float(parselmouth.praat.call(point_process, "Get jitter (local)", 0, 0, 60.0, 400.0, 1.3, 1.6))
+    except Exception:
+        jitter_local = np.nan
+    try:
+        shimmer_local = float(parselmouth.praat.call([snd, point_process], "Get shimmer (local)", 0, 0, 60.0, 400.0, 1.3, 1.6, 0.03, 0.45))
+    except Exception:
+        shimmer_local = np.nan
+
+    out = {
+        "praat_f0_mean_hz": f0_mean,
+        "praat_f0_std_hz": f0_std,
+        "praat_f0_min_hz": f0_min,
+        "praat_f0_max_hz": f0_max,
+        "praat_hnr_mean_db": hnr_mean,
+        "praat_jitter_local": jitter_local,
+        "praat_shimmer_local": shimmer_local,
     }
 
-    if not PARSELMOUTH_OK:
-        return feats
+    return out
 
-    try:
-        snd = parselmouth.Sound(y, sampling_frequency=sr)
 
-        pitch = snd.to_pitch(time_step=0.0, pitch_floor=75, pitch_ceiling=500)
-        f0 = pitch.selected_array["frequency"]
-        f0 = f0[np.isfinite(f0)]
-        f0 = f0[f0 > 0]
-        if len(f0) > 0:
-            feats["praat_f0_mean_hz"] = float(np.mean(f0))
-            feats["praat_f0_std_hz"] = float(np.std(f0))
-            feats["praat_f0_min_hz"] = float(np.min(f0))
-            feats["praat_f0_max_hz"] = float(np.max(f0))
-            feats["praat_f0_median_hz"] = float(np.median(f0))
-            feats["praat_f0_range_hz"] = float(np.max(f0) - np.min(f0))
+def load_file_list() -> pd.DataFrame:
+    if not INPUT_FILE_LIST.exists():
+        raise FileNotFoundError(f"Missing input: {INPUT_FILE_LIST}")
+
+    df = pd.read_csv(INPUT_FILE_LIST)
+    required = {"path", "speaker", "label"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"{INPUT_FILE_LIST.name} missing required columns: {sorted(missing)}")
+
+    df = df[df["label"].isin(LABEL_MAP.keys())].copy()
+    df["path"] = df["path"].astype(str)
+    df["speaker"] = df["speaker"].astype(str)
+
+    if df.empty:
+        raise ValueError("No rows left after label filter (expected pd/control_elderly).")
+
+    return df
+
+
+def build_person_tables_for_condition(condition: dict[str, Any]) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    name = condition["name"]
+    cache_base = CACHE_DIR / f"{name}_person_baseline.csv"
+    cache_plus = CACHE_DIR / f"{name}_person_plus_praat.csv"
+    cache_qc = CACHE_DIR / f"{name}_qc.json"
+
+    if cache_base.exists() and cache_plus.exists() and cache_qc.exists():
+        return pd.read_csv(cache_base), pd.read_csv(cache_plus), json.loads(cache_qc.read_text(encoding="utf-8"))
+
+    files = load_file_list()
+    rows: list[dict[str, Any]] = []
+    n_read_fail = 0
+
+    for r in files.itertuples(index=False):
+        path = str(r.path)
+        speaker = str(r.speaker)
+        label = str(r.label)
 
         try:
-            harm = snd.to_harmonicity_cc(time_step=0.01, minimum_pitch=75)
-            hvals = np.array(harm.values).flatten()
-            hvals = hvals[np.isfinite(hvals)]
-            if len(hvals) > 0:
-                feats["praat_hnr_mean_db"] = float(np.mean(hvals))
+            y, _ = librosa.load(path, sr=SR, mono=True)
         except Exception:
-            pass
+            n_read_fail += 1
+            continue
 
-        try:
-            pp = praat_call(snd, "To PointProcess (periodic, cc)", 75, 500)
-            feats["praat_jitter_local"] = safe_float(
-                praat_call(pp, "Get jitter (local)", 0, 0, 0.0001, 0.02, 1.3)
-            )
-            feats["praat_shimmer_local"] = safe_float(
-                praat_call([snd, pp], "Get shimmer (local)", 0, 0, 0.0001, 0.02, 1.3, 1.6)
-            )
-        except Exception:
-            pass
-
-    except Exception:
-        return feats
-
-    return feats
-
-
-def infer_label(row: pd.Series) -> str | None:
-    if "label" in row and isinstance(row["label"], str) and row["label"].strip():
-        return row["label"].strip()
-
-    g = str(row.get("group", "")).lower()
-    if "parkinson" in g:
-        return "pd"
-    if "elderly" in g and "control" in g:
-        return "control_elderly"
-    if "young" in g and "control" in g:
-        return "control_young"
-    return None
-
-
-def normalize_task(s: str) -> str | None:
-    if not s:
-        return None
-    s = str(s).strip()
-    if not s:
-        return None
-    m = re.match(r"^([A-Za-z]{1,2}\d)", s)
-    if m:
-        return m.group(1).upper()
-    if len(s) >= 3:
-        return s[:3].upper()
-    return s.upper()
-
-
-def infer_task_code(row: pd.Series) -> str | None:
-    if "task_code" in row and pd.notna(row["task_code"]):
-        t = normalize_task(row["task_code"])
-        if t:
-            return t
-    fn = str(row.get("filename", "")) or Path(str(row.get("path", ""))).name
-    return normalize_task(fn)
-
-
-def infer_speaker(row: pd.Series) -> str | None:
-    if "speaker" in row and isinstance(row["speaker"], str) and row["speaker"].strip():
-        return row["speaker"].strip()
-    p = Path(str(row.get("path", "")))
-    if p.exists():
-        return p.parent.name
-    return None
-
-
-def build_person_table_for_condition(condition: str, with_praat: bool) -> pd.DataFrame:
-    tag = "plus_praat" if with_praat else "baseline"
-    cache_path = CACHE_DIR / f"{condition}_{tag}_person.csv"
-    if cache_path.exists():
-        return pd.read_csv(cache_path)
-
-    if not FILE_INDEX_PATH.exists():
-        raise FileNotFoundError(f"Hittar inte {FILE_INDEX_PATH}. Kör 00_build_index.py först.")
-
-    idx = pd.read_csv(FILE_INDEX_PATH)
-
-    idx["label_std"] = idx.apply(infer_label, axis=1)
-    idx["task_std"] = idx.apply(infer_task_code, axis=1)
-    idx["speaker_std"] = idx.apply(infer_speaker, axis=1)
-
-    if condition == "clean" and tag == "baseline":
-        print("\n[DEBUG] Top group values:")
-        if "group" in idx.columns:
-            print(idx["group"].value_counts().head(5).to_string())
-        print("\n[DEBUG] Top inferred task_std values:")
-        print(idx["task_std"].value_counts().head(15).to_string())
-        print("\n[DEBUG] Top inferred label_std values:")
-        print(idx["label_std"].value_counts().head(10).to_string())
-        print()
-
-    idx = idx[idx["label_std"].isin(["pd", "control_elderly"])].copy()
-    idx = idx[idx["task_std"].isin(VOWELS_PACK_TASKS)].copy()
-    idx = idx.dropna(subset=["speaker_std", "path"]).copy()
-    idx["y"] = (idx["label_std"] == "pd").astype(int)
-
-    print(f"[{condition} | {tag}] Matched files after filters: {len(idx)}")
-
-    rows = []
-    missing = 0
-    for r in idx.itertuples(index=False):
-        path = getattr(r, "path")
-        speaker = getattr(r, "speaker_std")
-        ylab = int(getattr(r, "y"))
-
-        seed = stable_u32(f"{condition}::{path}")
+        seed = stable_seed(f"{name}::{path}")
         rng = np.random.default_rng(seed)
+        y2 = apply_condition(y, condition, rng)
 
-        try:
-            ysig, sr = load_audio(path, sr=SR)
-            ysig = apply_condition(ysig, condition, rng)
-            feats = baseline_features(ysig, sr)
-            if with_praat:
-                feats.update(praat_features(ysig, sr))
-            feats["speaker"] = speaker
-            feats["y"] = ylab
-            rows.append(feats)
-        except Exception:
-            missing += 1
+        b = baseline_features(y2, SR)
+        p = praat_features(y2, SR)
 
-    df_file = pd.DataFrame(rows)
-    print(f"[{condition} | {tag}] Feature rows built: {len(df_file)} | missing: {missing}")
+        row: dict[str, Any] = {"speaker": speaker, "label": label}
+        row.update(b)
+        row.update(p)
+        rows.append(row)
 
-    if df_file.empty:
-        raise RuntimeError(f"Inga features skapades för condition={condition}, tag={tag}.")
+    if not rows:
+        raise RuntimeError(f"No feature rows extracted for condition={name}")
 
-    feature_cols = [c for c in df_file.columns if c not in ["speaker", "y"]]
-    df_person = df_file.groupby(["speaker", "y"], as_index=False)[feature_cols].mean(numeric_only=True)
+    file_df = pd.DataFrame(rows)
+    feat_cols = [c for c in file_df.columns if c not in ["speaker", "label"]]
+    person_df = file_df.groupby(["speaker", "label"], as_index=False)[feat_cols].mean(numeric_only=True)
 
-    df_person.to_csv(cache_path, index=False)
-    print(f"[{condition} | {tag}] Saved cache: {cache_path} (rows={len(df_person)})")
-    # --- PATCH: robust merge of Praat person features (fail-fast if missing) ---
-    if with_praat:
-        df_person = merge_praat_person_features(df_person, praat_person_csv=r"data_index\praat_vowels_pack_person.csv")
-    # --- END PATCH ---
+    praat_cols = [c for c in person_df.columns if c.startswith("praat_")]
+    base_cols = [c for c in person_df.columns if c not in ["speaker", "label"] + praat_cols]
 
-    return df_person
+    baseline_person = person_df[["speaker", "label"] + base_cols].copy()
+    plus_person = person_df[["speaker", "label"] + base_cols + praat_cols].copy()
+
+    def nan_stats(df_: pd.DataFrame, cols: list[str]) -> dict[str, float]:
+        if not cols:
+            return {"max_nan_rate": 1.0, "median_nan_rate": 1.0}
+        nan_rates = df_[cols].isna().mean(axis=0)
+        return {
+            "max_nan_rate": float(nan_rates.max()),
+            "median_nan_rate": float(nan_rates.median()),
+        }
+
+    qc = {
+        "condition": name,
+        "n_input_files": int(len(files)),
+        "n_feature_rows": int(len(file_df)),
+        "n_read_fail": int(n_read_fail),
+        "n_speakers": int(len(person_df)),
+        "n_pd": int((person_df["label"] == "pd").sum()),
+        "n_control": int((person_df["label"] == "control_elderly").sum()),
+        "baseline_nan": nan_stats(baseline_person, base_cols),
+        "praat_nan": nan_stats(plus_person, praat_cols),
+    }
+
+    if qc["n_pd"] < 2 or qc["n_control"] < 2:
+        raise RuntimeError(f"Too few speakers per class for condition={name}: {qc}")
+
+    # Some Praat descriptors (especially jitter/shimmer) can fail on certain
+    # recordings/conditions while core Praat descriptors (f0/HNR) remain valid.
+    # Fail only if the core Praat block is almost entirely missing.
+    core_praat_cols = [c for c in praat_cols if c in {"praat_f0_mean_hz", "praat_f0_std_hz", "praat_hnr_mean_db"}]
+    core_nan = plus_person[core_praat_cols].isna().mean(axis=0) if core_praat_cols else pd.Series(dtype=float)
+    core_max_nan = float(core_nan.max()) if not core_nan.empty else 1.0
+    qc["praat_nan"]["core_max_nan_rate"] = core_max_nan
+
+    if core_max_nan > 0.95:
+        raise RuntimeError(
+            f"Core Praat features are almost entirely missing for condition={name}. "
+            f"Check audio quality/parselmouth setup. QC={qc['praat_nan']}"
+        )
+
+    baseline_person.to_csv(cache_base, index=False)
+    plus_person.to_csv(cache_plus, index=False)
+    cache_qc.write_text(json.dumps(qc, indent=2), encoding="utf-8")
+
+    return baseline_person, plus_person, qc
 
 
-def pooled_conformal_prediction_sets(
-    proba_test: np.ndarray,
-    proba_cal: np.ndarray,
-    y_cal: np.ndarray,
-    alpha: float,
-    classes: np.ndarray,
-) -> list[set[int]]:
-    class_to_col = {int(c): j for j, c in enumerate(classes)}
-    true_scores = np.array([proba_cal[i, class_to_col[int(y_cal[i])]] for i in range(len(y_cal))], dtype=float)
-    n = len(true_scores)
+def conformal_sets_binary(proba_test: np.ndarray, proba_cal: np.ndarray, y_cal: np.ndarray, alpha: float) -> list[set[int]]:
+    classes = np.array([0, 1], dtype=int)
+    score_true = np.array([proba_cal[i, int(y_cal[i])] for i in range(len(y_cal))], dtype=float)
+    n = len(score_true)
 
-    pred_sets: list[set[int]] = []
+    out: list[set[int]] = []
     for i in range(proba_test.shape[0]):
-        s = set()
+        s: set[int] = set()
         for k in classes:
-            pk = proba_test[i, class_to_col[int(k)]]
-            pval = (np.sum(true_scores <= pk) + 1.0) / (n + 1.0)
+            pval = (np.sum(score_true <= proba_test[i, k]) + 1.0) / (n + 1.0)
             if pval > alpha:
                 s.add(int(k))
-        pred_sets.append(s)
-    return pred_sets
+        out.append(s)
+    return out
 
 
-def eval_conformal_screening_repeated(
-    df_person: pd.DataFrame,
-    feature_cols: list[str],
-    alpha: float,
-    n_splits: int,
-    test_size: float,
-    calib_frac_of_train: float,
-    seed0: int,
-) -> pd.DataFrame:
-    X = df_person[feature_cols].to_numpy(dtype=float)
-    y = df_person["y"].to_numpy(dtype=int)
+def evaluate_condition_variant(df: pd.DataFrame, condition_name: str, variant: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    feature_cols = [c for c in df.columns if c not in ["speaker", "label"]]
+    # Guard against columns that are entirely NaN (common for some Praat columns
+    # in noisy conditions). Median imputation cannot recover an all-NaN column.
+    feature_cols = [c for c in feature_cols if not df[c].isna().all()]
+    if not feature_cols:
+        raise RuntimeError(f"No usable feature columns left for condition={condition_name}, variant={variant}")
+    X = df[feature_cols].to_numpy(dtype=float)
+    y = df["label"].map(LABEL_MAP).astype(int).to_numpy()
 
-    sss = StratifiedShuffleSplit(n_splits=n_splits, test_size=test_size, random_state=seed0)
+    sss = StratifiedShuffleSplit(n_splits=N_SPLITS, test_size=TEST_SIZE, random_state=RANDOM_STATE)
 
-    rows = []
+    split_rows: list[dict[str, Any]] = []
+    conf_rows: list[dict[str, Any]] = []
+
     for split_idx, (traincal_idx, test_idx) in enumerate(sss.split(X, y), start=1):
-        X_traincal, y_traincal = X[traincal_idx], y[traincal_idx]
-        X_test, y_test = X[test_idx], y[test_idx]
+        X_traincal = X[traincal_idx]
+        y_traincal = y[traincal_idx]
+        X_test = X[test_idx]
+        y_test = y[test_idx]
 
-        sss2 = StratifiedShuffleSplit(
-            n_splits=1, test_size=calib_frac_of_train, random_state=seed0 + 10_000 + split_idx
-        )
-        train_idx_rel, calib_idx_rel = next(sss2.split(X_traincal, y_traincal))
-        X_train, y_train = X_traincal[train_idx_rel], y_traincal[train_idx_rel]
-        X_cal, y_cal = X_traincal[calib_idx_rel], y_traincal[calib_idx_rel]
+        inner = StratifiedShuffleSplit(n_splits=1, test_size=CALIB_FRAC_OF_TRAIN, random_state=RANDOM_STATE + 10000 + split_idx)
+        train_rel, cal_rel = next(inner.split(X_traincal, y_traincal))
+
+        X_train = X_traincal[train_rel]
+        y_train = y_traincal[train_rel]
+        X_cal = X_traincal[cal_rel]
+        y_cal = y_traincal[cal_rel]
 
         model = Pipeline(
             steps=[
                 ("imputer", SimpleImputer(strategy="median")),
                 ("scaler", StandardScaler()),
-                ("clf", LogisticRegression(max_iter=2000, solver="liblinear")),
+                ("clf", LogisticRegression(max_iter=3000, solver="liblinear")),
             ]
         )
         model.fit(X_train, y_train)
@@ -470,143 +339,170 @@ def eval_conformal_screening_repeated(
         proba_cal = model.predict_proba(X_cal)
         proba_test = model.predict_proba(X_test)
 
-        try:
-            pos_col = list(model.named_steps["clf"].classes_).index(1)
-            auc = float(roc_auc_score(y_test, proba_test[:, pos_col]))
-        except Exception:
-            auc = np.nan
+        auc = float(roc_auc_score(y_test, proba_test[:, 1]))
+        pred_sets = conformal_sets_binary(proba_test, proba_cal, y_cal, ALPHA)
 
-        classes = model.named_steps["clf"].classes_
-        pred_sets = pooled_conformal_prediction_sets(
-            proba_test=proba_test,
-            proba_cal=proba_cal,
-            y_cal=y_cal,
-            alpha=alpha,
-            classes=classes,
-        )
+        sizes = np.array([len(s) for s in pred_sets], dtype=int)
+        decided_mask = sizes == 1
+        unsure_mask = ~decided_mask
 
-        covered = [int(y_test[i] in pred_sets[i]) for i in range(len(y_test))]
-        sizes = [len(s) for s in pred_sets]
-        decided_mask = np.array([sz == 1 for sz in sizes], dtype=bool)
+        covered = np.array([int(y_test[i] in pred_sets[i]) for i in range(len(y_test))], dtype=int)
+
+        pred_decided = np.array([next(iter(pred_sets[i])) if decided_mask[i] else -1 for i in range(len(y_test))], dtype=int)
 
         acc_decided = np.nan
-        if decided_mask.any():
-            pred_labels = []
-            for s in pred_sets:
-                pred_labels.append(next(iter(s)) if len(s) == 1 else -1)
-            pred_labels = np.array(pred_labels, dtype=int)
-            acc_decided = float(np.mean(pred_labels[decided_mask] == y_test[decided_mask]))
+        if np.any(decided_mask):
+            acc_decided = float(np.mean(pred_decided[decided_mask] == y_test[decided_mask]))
 
-        rows.append({
-            "split": split_idx,
-            "n_test": int(len(y_test)),
-            "auc": auc,
-            "coverage": float(np.mean(covered)),
-            "decided_rate": float(np.mean(decided_mask)),
-            "unsure_rate": float(np.mean(~decided_mask)),
-            "acc_decided": acc_decided,
-        })
+        split_rows.append(
+            {
+                "condition": condition_name,
+                "variant": variant,
+                "split": split_idx,
+                "n_test": int(len(y_test)),
+                "n_decided": int(np.sum(decided_mask)),
+                "n_unsure": int(np.sum(unsure_mask)),
+                "auc": auc,
+                "coverage": float(np.mean(covered)),
+                "decided_rate": float(np.mean(decided_mask)),
+                "unsure_rate": float(np.mean(unsure_mask)),
+                "acc_decided": acc_decided,
+            }
+        )
 
+        # Confusion on all forced predictions (argmax) for comparability
+        pred_all = np.argmax(proba_test, axis=1)
+        for yt, yp in zip(y_test, pred_all):
+            conf_rows.append(
+                {
+                    "condition": condition_name,
+                    "variant": variant,
+                    "split": split_idx,
+                    "matrix": "all_forced",
+                    "true_label": INV_LABEL_MAP[int(yt)],
+                    "pred_label": INV_LABEL_MAP[int(yp)],
+                    "count": 1,
+                }
+            )
+
+        # Confusion on decided-only predictions
+        for yt, yp in zip(y_test[decided_mask], pred_decided[decided_mask]):
+            conf_rows.append(
+                {
+                    "condition": condition_name,
+                    "variant": variant,
+                    "split": split_idx,
+                    "matrix": "decided_only",
+                    "true_label": INV_LABEL_MAP[int(yt)],
+                    "pred_label": INV_LABEL_MAP[int(yp)],
+                    "count": 1,
+                }
+            )
+
+        # Unsure accounting (kept separately)
+        for yt in y_test[unsure_mask]:
+            conf_rows.append(
+                {
+                    "condition": condition_name,
+                    "variant": variant,
+                    "split": split_idx,
+                    "matrix": "unsure",
+                    "true_label": INV_LABEL_MAP[int(yt)],
+                    "pred_label": "unsure",
+                    "count": 1,
+                }
+            )
+
+    split_df = pd.DataFrame(split_rows)
+    conf_df = pd.DataFrame(conf_rows)
+
+    return split_df, conf_df
+
+
+def summarize_splits(df: pd.DataFrame) -> pd.DataFrame:
+    keys = ["condition", "variant"]
+    rows: list[dict[str, Any]] = []
+    for (condition, variant), g in df.groupby(keys):
+        rows.append(
+            {
+                "condition": condition,
+                "variant": variant,
+                "n_splits": int(len(g)),
+                "n_test_total": int(g["n_test"].sum()),
+                "n_decided_total": int(g["n_decided"].sum()),
+                "n_unsure_total": int(g["n_unsure"].sum()),
+                "auc_mean": float(g["auc"].mean()),
+                "auc_std": float(g["auc"].std(ddof=1)),
+                "coverage_mean": float(g["coverage"].mean()),
+                "coverage_std": float(g["coverage"].std(ddof=1)),
+                "decided_rate_mean": float(g["decided_rate"].mean()),
+                "decided_rate_std": float(g["decided_rate"].std(ddof=1)),
+                "unsure_rate_mean": float(g["unsure_rate"].mean()),
+                "unsure_rate_std": float(g["unsure_rate"].std(ddof=1)),
+                "acc_decided_mean": float(g["acc_decided"].mean()),
+                "acc_decided_std": float(g["acc_decided"].std(ddof=1)),
+            }
+        )
     return pd.DataFrame(rows)
 
 
-def summarize_metrics(df_splits: pd.DataFrame) -> dict[str, float]:
-    out = {}
-    for col in ["auc", "coverage", "decided_rate", "unsure_rate", "acc_decided"]:
-        out[f"{col}_mean"] = float(df_splits[col].mean())
-        out[f"{col}_std"] = float(df_splits[col].std(ddof=1))
-    return out
-
-
 def main() -> None:
-    print("=== Robustness + Conformal screening (vowels_pack) ===")
-    print(f"alpha={ALPHA} | n_splits={N_SPLITS} | test_size={TEST_SIZE} | calib_frac_of_train={CALIB_FRAC_OF_TRAIN}")
-    if not PARSELMOUTH_OK:
-        print("OBS: parselmouth saknas -> kommer bara köra baseline (ingen +Praat).")
+    print("=== Step 43 rebuild: robustness + conformal screening (vowels_pack) ===")
+    print(f"alpha={ALPHA}, n_splits={N_SPLITS}, test_size={TEST_SIZE}, calib_frac={CALIB_FRAC_OF_TRAIN}")
 
-    all_split_rows = []
-    summary_rows = []
+    split_parts: list[pd.DataFrame] = []
+    conf_parts: list[pd.DataFrame] = []
+    qc_parts: list[dict[str, Any]] = []
 
     for condition in CONDITIONS:
-        df_base = build_person_table_for_condition(condition, with_praat=False)
-        base_feature_cols = [c for c in df_base.columns if c not in ["speaker", "y"]]
+        cname = condition["name"]
+        print(f"\n[Condition] {cname}")
+        base_df, plus_df, qc = build_person_tables_for_condition(condition)
+        qc_parts.append(qc)
 
-        splits_base = eval_conformal_screening_repeated(
-            df_person=df_base,
-            feature_cols=base_feature_cols,
-            alpha=ALPHA,
-            n_splits=N_SPLITS,
-            test_size=TEST_SIZE,
-            calib_frac_of_train=CALIB_FRAC_OF_TRAIN,
-            seed0=123,
-        )
-        splits_base["condition"] = condition
-        splits_base["model"] = "baseline"
-        all_split_rows.append(splits_base)
+        s_base, c_base = evaluate_condition_variant(base_df, cname, "baseline")
+        s_plus, c_plus = evaluate_condition_variant(plus_df, cname, "baseline_plus_praat")
 
-        summary_rows.append({
-            "condition": condition,
-            "model": "baseline",
-            **summarize_metrics(splits_base),
-        })
+        split_parts.extend([s_base, s_plus])
+        conf_parts.extend([c_base, c_plus])
 
-        if PARSELMOUTH_OK:
-            df_praat = build_person_table_for_condition(condition, with_praat=True)
-            praat_feature_cols = [c for c in df_praat.columns if c not in ["speaker", "y"]]
+    per_split = pd.concat(split_parts, ignore_index=True)
+    summary = summarize_splits(per_split)
 
-            splits_praat = eval_conformal_screening_repeated(
-                df_person=df_praat,
-                feature_cols=praat_feature_cols,
-                alpha=ALPHA,
-                n_splits=N_SPLITS,
-                test_size=TEST_SIZE,
-                calib_frac_of_train=CALIB_FRAC_OF_TRAIN,
-                seed0=123,
-            )
-            splits_praat["condition"] = condition
-            splits_praat["model"] = "plus_praat"
-            all_split_rows.append(splits_praat)
+    conf_long = pd.concat(conf_parts, ignore_index=True)
+    conf_agg = (
+        conf_long.groupby(["condition", "variant", "matrix", "true_label", "pred_label"], as_index=False)["count"]
+        .sum()
+        .sort_values(["condition", "variant", "matrix", "true_label", "pred_label"])
+    )
 
-            summary_rows.append({
-                "condition": condition,
-                "model": "plus_praat",
-                **summarize_metrics(splits_praat),
-            })
+    per_split.to_csv(OUT_PER_SPLIT, index=False)
+    summary.to_csv(OUT_SUMMARY, index=False)
+    conf_agg.to_csv(OUT_CONFUSION, index=False)
 
-    df_all_splits = pd.concat(all_split_rows, ignore_index=True)
-    df_summary = pd.DataFrame(summary_rows)
+    runinfo = {
+        "alpha": ALPHA,
+        "n_splits": N_SPLITS,
+        "test_size": TEST_SIZE,
+        "calib_frac_of_train": CALIB_FRAC_OF_TRAIN,
+        "random_state": RANDOM_STATE,
+        "conditions": CONDITIONS,
+        "input_file": str(INPUT_FILE_LIST),
+        "cache_dir": str(CACHE_DIR),
+        "qc": qc_parts,
+        "outputs": {
+            "per_split": str(OUT_PER_SPLIT),
+            "summary": str(OUT_SUMMARY),
+            "confusion_counts": str(OUT_CONFUSION),
+        },
+    }
+    OUT_RUNINFO.write_text(json.dumps(runinfo, indent=2), encoding="utf-8")
 
-    df_all_splits.to_csv(OUT_PER_SPLIT, index=False)
-    df_summary.to_csv(OUT_SUMMARY, index=False)
-
-    comp_rows = []
-    for condition in CONDITIONS:
-        b = df_summary[(df_summary["condition"] == condition) & (df_summary["model"] == "baseline")]
-        p = df_summary[(df_summary["condition"] == condition) & (df_summary["model"] == "plus_praat")]
-        if b.empty:
-            continue
-
-        row = {"condition": condition}
-        for metric in ["auc", "coverage", "decided_rate", "unsure_rate", "acc_decided"]:
-            row[f"baseline_{metric}_mean"] = float(b[f"{metric}_mean"].iloc[0])
-            row[f"baseline_{metric}_std"] = float(b[f"{metric}_std"].iloc[0])
-            if not p.empty:
-                row[f"plus_praat_{metric}_mean"] = float(p[f"{metric}_mean"].iloc[0])
-                row[f"plus_praat_{metric}_std"] = float(p[f"{metric}_std"].iloc[0])
-                row[f"delta_{metric}_mean"] = row[f"plus_praat_{metric}_mean"] - row[f"baseline_{metric}_mean"]
-        comp_rows.append(row)
-
-    df_compare = pd.DataFrame(comp_rows)
-    df_compare.to_csv(OUT_COMPARE, index=False)
-
-    print("\n=== KLART ===")
-    print(f"Saved per-split: {OUT_PER_SPLIT}")
-    print(f"Saved summary  : {OUT_SUMMARY}")
-    print(f"Saved compare : {OUT_COMPARE}")
-
-    with pd.option_context("display.max_columns", 999, "display.width", 160):
-        print("\nSummary (first rows):")
-        print(df_summary.head(10).to_string(index=False))
+    print("\nSaved:")
+    print(f" - {OUT_PER_SPLIT}")
+    print(f" - {OUT_SUMMARY}")
+    print(f" - {OUT_CONFUSION}")
+    print(f" - {OUT_RUNINFO}")
 
 
 if __name__ == "__main__":
